@@ -224,7 +224,7 @@ my_week/
 You need the Flutter SDK and Google Chrome (or an Android phone or emulator).
 
 ```
-git clone https://github.com/YOUR-USERNAME/my_week.git
+git clone https://github.com/Mrs-luwase/my_week.git
 cd my_week
 flutter pub get
 flutter run -d chrome
