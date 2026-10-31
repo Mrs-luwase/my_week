@@ -1,9 +1,27 @@
-import 'dart:convert';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'auth_gate.dart';
 import 'quote.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // On the web (Chrome) Firebase needs these values. On Android it reads
+  // google-services.json instead, so options stays null there.
+  await Firebase.initializeApp(
+    options: kIsWeb
+        ? const FirebaseOptions(
+      apiKey: 'AIzaSyBTyUAyWy50qLfpeZ5yCfKoH6pw-Lqft-4',
+      authDomain: 'my-week-9a5c4.firebaseapp.com',
+      projectId: 'my-week-9a5c4',
+      storageBucket: 'my-week-9a5c4.firebasestorage.app',
+      messagingSenderId: '741602448737',
+      appId: '1:741602448737:web:7fd774bed954ff6c5ba120',
+    )
+        : null,
+  );
   runApp(const MyWeekApp());
 }
 
@@ -59,7 +77,7 @@ class MyWeekApp extends StatelessWidget {
           shape: CircleBorder(),
         ),
       ),
-      home: const WeekScreen(),
+      home: const AuthGate(),
     );
   }
 }
@@ -103,9 +121,9 @@ int? parseTime(String text) {
 }
 
 // Returns EVERY other course that overlaps with [c] (empty list = no clash).
-List<Course> findClashes(Course c) {
-  return sampleCourses.where((other) {
-    return !identical(other, c) &&
+List<Course> findClashes(Course c, List<Course> all) {
+  return all.where((other) {
+    return other.id != c.id &&
         other.day == c.day &&
         c.startMinutes < other.endMinutes &&
         other.startMinutes < c.endMinutes;
@@ -122,32 +140,14 @@ class WeekScreen extends StatefulWidget {
 class _WeekScreenState extends State<WeekScreen> {
   String selectedDay = 'Monday';
 
-  @override
-  void initState() {
-    super.initState();
-    start();
-  }
-
-  Future<void> start() async {
-    await loadCourses();
-    if (!mounted) return;
-    setState(() {});
-  }
-
   Future<void> addCourse() async {
     final newCourse = await Navigator.push<Course>(
       context,
       MaterialPageRoute(builder: (_) => const AddCourseScreen()),
     );
-    if (newCourse != null) {
-      setState(() {
-        sampleCourses.add(newCourse);
-        selectedDay = newCourse.day;
-      });
-      saveCourses();
-    }
-
-
+    if (newCourse == null || !mounted) return;
+    setState(() => selectedDay = newCourse.day);
+    await myCourses().add(newCourse.toMap());
   }
 
   Future<void> editCourse(Course c) async {
@@ -155,13 +155,9 @@ class _WeekScreenState extends State<WeekScreen> {
       context,
       MaterialPageRoute(builder: (_) => AddCourseScreen(existing: c)),
     );
-    if (updated != null) {
-      setState(() {
-        sampleCourses[sampleCourses.indexOf(c)] = updated;
-        selectedDay = updated.day;
-      });
-      saveCourses();
-    }
+    if (updated == null || !mounted) return;
+    setState(() => selectedDay = updated.day);
+    await myCourses().doc(c.id).update(updated.toMap());
   }
 
   Future<void> deleteCourse(Course c) async {
@@ -182,9 +178,7 @@ class _WeekScreenState extends State<WeekScreen> {
     );
     if (ok != true) return;
 
-    final index = sampleCourses.indexOf(c);
-    setState(() => sampleCourses.remove(c));
-    saveCourses();
+    await myCourses().doc(c.id).delete();
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -192,10 +186,7 @@ class _WeekScreenState extends State<WeekScreen> {
         content: Text('${c.name} deleted'),
         action: SnackBarAction(
           label: 'Undo',
-          onPressed: () {
-            setState(() => sampleCourses.insert(index, c));
-            saveCourses();
-          },
+          onPressed: () => myCourses().doc(c.id).set(c.toMap()),
         ),
       ),
     );
@@ -238,8 +229,8 @@ class _WeekScreenState extends State<WeekScreen> {
     );
   }
 
-  Widget courseRow(Course c, int i) {
-    final clashes = findClashes(c);
+  Widget courseRow(Course c, int i, List<Course> all) {
+    final clashes = findClashes(c, all);
     final hasClash = clashes.isNotEmpty;
     final accent = hasClash ? Colors.red.shade400 : accents[i % accents.length];
     final roomText = c.room.isEmpty ? '' : ' · ${c.room}';
@@ -330,15 +321,42 @@ class _WeekScreenState extends State<WeekScreen> {
     );
   }
 
+  // The screen listens to Firestore: it rebuilds by itself whenever the
+  // courses change, so there is no setState for the data.
   @override
   Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: myCourses().snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Scaffold(
+            body: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text('Could not load your courses.\n${snapshot.error}',
+                    textAlign: TextAlign.center),
+              ),
+            ),
+          );
+        }
+        if (!snapshot.hasData) {
+          return const Scaffold(
+              body: Center(child: CircularProgressIndicator()));
+        }
+        final courses = snapshot.data!.docs.map(Course.fromDoc).toList();
+        return buildContent(context, courses);
+      },
+    );
+  }
+
+  Widget buildContent(BuildContext context, List<Course> courses) {
     final todaysCourses =
-    sampleCourses.where((c) => c.day == selectedDay).toList();
+    courses.where((c) => c.day == selectedDay).toList();
     todaysCourses.sort((a, b) => a.startMinutes.compareTo(b.startMinutes));
 
     final dayMinutes = todaysCourses.fold<int>(
         0, (sum, c) => sum + (c.endMinutes - c.startMinutes));
-    final weekMinutes = sampleCourses.fold<int>(
+    final weekMinutes = courses.fold<int>(
         0, (sum, c) => sum + (c.endMinutes - c.startMinutes));
     final weekStart = mondayOfThisWeek();
 
@@ -352,6 +370,13 @@ class _WeekScreenState extends State<WeekScreen> {
             Text('My Week'),
           ],
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Log out',
+            onPressed: () => FirebaseAuth.instance.signOut(),
+          ),
+        ],
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: addCourse,
@@ -424,7 +449,7 @@ class _WeekScreenState extends State<WeekScreen> {
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 90),
               itemCount: todaysCourses.length,
               itemBuilder: (context, i) =>
-                  courseRow(todaysCourses[i], i),
+                  courseRow(todaysCourses[i], i, courses),
             ),
           ),
         ],
@@ -548,6 +573,7 @@ class _AddCourseScreenState extends State<AddCourseScreen> {
   }
 }
 class Course {
+  final String id;
   final String name;
   final String day;
   final int startMinutes;
@@ -555,6 +581,7 @@ class Course {
   final String room;
 
   const Course({
+    this.id = '',
     required this.name,
     required this.day,
     required this.startMinutes,
@@ -562,49 +589,52 @@ class Course {
     required this.room,
   });
 
-  Map<String, dynamic> toJson() {
-    return {
-      'name': name,
-      'day': day,
-      'start': startMinutes,
-      'end': endMinutes,
-      'room': room,
-    };
-  }
+  // Course -> fields that Firestore can store
+  Map<String, dynamic> toMap() => {
+    'name': name,
+    'day': day,
+    'start': startMinutes,
+    'end': endMinutes,
+    'room': room,
+  };
 
-  factory Course.fromJson(Map<String, dynamic> json) {
+  // Firestore document -> Course
+  factory Course.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
     return Course(
-      name: json['name'] as String,
-      day: json['day'] as String,
-      startMinutes: json['start'] as int,
-      endMinutes: json['end'] as int,
-      room: json['room'] as String,
+      id: doc.id,
+      name: data['name'] as String,
+      day: data['day'] as String,
+      startMinutes: (data['start'] as num).toInt(),
+      endMinutes: (data['end'] as num).toInt(),
+      room: data['room'] as String,
     );
   }
 }
 
-final List<Course> sampleCourses = [
-  const Course(name: 'System Analysis and Design', day: 'Monday', startMinutes: 510, endMinutes: 630, room: 'A101'),
-  const Course(name: 'Linux', day: 'Monday', startMinutes: 600, endMinutes: 720, room: 'Lab 2'),
-  const Course(name: 'Mobile Programming', day: 'Tuesday', startMinutes: 840, endMinutes: 960, room: 'Lab 1'),
-];
-
-Future<void> saveCourses() async {
-  final prefs = await SharedPreferences.getInstance();
-  final list = sampleCourses.map((c) => c.toJson()).toList();
-  await prefs.setString('courses', jsonEncode(list));
+// The logged-in user's courses live at users/{uid}/courses
+CollectionReference<Map<String, dynamic>> myCourses() {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+      .collection('users')
+      .doc(uid)
+      .collection('courses');
 }
 
-Future<void> loadCourses() async {
-  final prefs = await SharedPreferences.getInstance();
-  final saved = prefs.getString('courses');
-  if (saved != null) {
-    final list = jsonDecode(saved) as List;
-    sampleCourses
-      ..clear()
-      ..addAll(list.map((x) => Course.fromJson(x as Map<String, dynamic>)));
+// Sample data, written once when a new account is created
+Future<void> addSampleCourses() async {
+  const samples = [
+    Course(name: 'System Analysis and Design', day: 'Monday', startMinutes: 510, endMinutes: 630, room: 'A101'),
+    Course(name: 'Linux', day: 'Monday', startMinutes: 600, endMinutes: 720, room: 'Lab 2'),
+    Course(name: 'Mobile Programming', day: 'Tuesday', startMinutes: 840, endMinutes: 960, room: 'Lab 1'),
+  ];
+  final batch = FirebaseFirestore.instance.batch();
+  for (final c in samples) {
+    batch.set(myCourses().doc(), c.toMap());
   }
+  await batch.commit();
 }
+
 class QuoteBanner extends StatefulWidget {
   const QuoteBanner({super.key});
 
